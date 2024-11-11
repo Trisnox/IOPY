@@ -11,6 +11,7 @@ This library deconstruct `.iop` file which then later can be extracted. Or const
 Run this command on command line
 ```sh
 > git clone https://github.com/Trisnox/IOPY
+> cd IOPY
 > pip install .
 ```
 
