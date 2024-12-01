@@ -1,3 +1,4 @@
+import argparse
 import io
 import os
 import pathlib
@@ -122,12 +123,16 @@ class IOP():
         uncompressed_size: class `int` type: `kwags`
             File size of uncompressed data. Ignored for deconstructing
 
+        central_count: class: `int` type: `kwargs`
+            Total count of central headers inside file. Only used if `is_last` is `True`. Ignored for deconstructing
+
+        central_size: class: `int` type: `kwargs`
+            Sum of total central length. Calculation: 46 + filename (from each entry) (+ comment, if any). Ignored for
+            deconstructing
+        
         central_offset: class: `int` type: `kwargs`
             Number of bytes offset for the first central header. Only used if `is_last` is `True`. Ignored for deconstructing
 
-        central_count: class: `int` type: `kwargs`
-            Total count of central headers inside file. Only used if `is_last` is `True`. Ignored for deconstructing
-        
         relative_offset: class: `int` type: `kwargs`
             The relative offset of local file header for this file entry. Ignored for deconstructing
     """
@@ -157,14 +162,19 @@ class IOP():
         self.INTERNAL_ATTRIBUTES = 0
         self.EXTERNAL_ATTRIBUTES = 0
         self.RELATIVE_OFFSET = kwargs.get('relative_offset', 0)
-        self.COMMENT = ''
+        self.COMMENT = b''
 
         self.ENTRY_BYTES = None
+        self.ENTRY_LENGTH = 0 # used for inserting, it's a shorthand
+        self.CENTRAL_LENGTH = 0 # same as above
+
+        # Indicates whether to use primary, or secondary password
+        self.IS_SECONDARY = False
 
         if not filename:
             self.__process_deconstruct()
         else:
-            self.__process_construct(kwargs.get('central_offset', 0), kwargs.get('central_count', 0))
+            self.__process_construct(kwargs.get('central_count', 0), kwargs.get('central_length', 0), kwargs.get('central_offset', 0))
 
     def __filename_base(self):
         """
@@ -178,7 +188,17 @@ class IOP():
     def __entry_bytes(self):
         return self.ENTRY[0][30 + self.FILENAME_LENGTH : 30 + self.FILENAME_LENGTH + self.COMPRESSED_SIZE]
 
-    def __process_construct(self, central_offset, central_count):
+    def __entry_length(self):
+        descriptor = 16 if self.ENCRYPTED and not self.IS_DIR else 0
+        return 30 + self.FILENAME_LENGTH + self.COMPRESSED_SIZE + descriptor
+    
+    def __central_length(self):
+        return 46 + self.FILENAME_LENGTH + self.COMMENT_LENGTH
+    
+    def __is_secondary(self):
+        return True if self.COMMENT == b'1' else False
+
+    def __process_construct(self, central_count, central_length, central_offset, comment = ''):
         """
         Function to construct .iop headers.
 
@@ -191,12 +211,13 @@ class IOP():
             eocd: End of Central Directory, if this was the last entry of the file or directory
         """
         self.IS_DIR = not isinstance(self.ENTRY, bytes)
+        self.ENTRY_BYTES = self.ENTRY if self.ENTRY else b''
 
         self.VERSION = len(self.FILENAME)
+        self.FILENAME_LENGTH = self.VERSION # for consistency, needed for inserting
         self.FLAGS = 0
         self.METHOD = 8
         self.COMPRESSED_SIZE = 0
-        self.FILENAME_LENGTH = 20
         self.EXTRA_FIELD = 0
         self.EXTERNAL_ATTRIBUTES = 2176057376 # file
 
@@ -219,9 +240,13 @@ class IOP():
             filename_length = 10
             cdfh_extra_field = 10
             self.EXTERNAL_ATTRIBUTES = 1107099664 # directory
+            self.ENTRY_LENGTH = 30 + self.FILENAME_LENGTH
         else:
+            self.ENTRY_BYTES = self.ENTRY
             self.COMPRESSED_SIZE = len(self.ENTRY)
             compressed_size = self.COMPRESSED_SIZE
+            self.ENTRY_LENGTH = 30 + self.FILENAME_LENGTH + len(self.ENTRY)
+            self.CENTRAL_LENGTH = 46 + self.FILENAME_LENGTH + len(comment)
 
         if self.ENCRYPTED and not self.IS_DIR:
             flags = 0
@@ -230,6 +255,7 @@ class IOP():
             compressed_size = 0
             uncompressed_size = 0
             extra_field = 9
+            self.ENTRY_LENGTH += 16
         
         self.HEADERS['local'] = [int.from_bytes(ZIP_LOCAL_HEADER_SIGNATURE, 'little'), self.VERSION, flags, method,
                                  self.MOD_TIME, self.MOD_DATE, crc32, compressed_size, uncompressed_size,
@@ -246,7 +272,7 @@ class IOP():
         if not self.IS_LAST:
             return
         
-        self.HEADERS['eocd'] = [int.from_bytes(ZIP_END_CENTRAL_HEADER_SIGNATURE, 'little'), 0, 0, central_count, central_count, 46+self.VERSION,
+        self.HEADERS['eocd'] = [int.from_bytes(ZIP_END_CENTRAL_HEADER_SIGNATURE, 'little'), 0, 0, central_count, central_count, central_length,
                                 central_offset, self.COMMENT_LENGTH]
 
     def __process_deconstruct(self):
@@ -321,18 +347,18 @@ class IOP():
         self.FILENAME_LENGTH = self.__filename_length()
 
         # Central directory file header
-        # CDFH = self.ENTRY.split(ZIP_CENTRAL_DIRECTORY_HEADER_SIGNATURE) # redundant due to splitting already done on IOPY()
         signature, self.VERSION_BY, self.VERSION, self.FLAGS, self.METHOD, mod_time, mod_date, \
         self.CRC32, self.COMPRESSED_SIZE, self.UNCOMPRESSED_SIZE, filename_length, extra_field, \
-        file_comment_length, self.DISK_NUMBER, self.INTERNAL_ATTRIBUTES, self.EXTERNAL_ATTRIBUTES, \
+        self.COMMENT_LENGTH, self.DISK_NUMBER, self.INTERNAL_ATTRIBUTES, self.EXTERNAL_ATTRIBUTES, \
         self.RELATIVE_OFFSET = struct.unpack('<IHHHHHHIIIHHHHHII', self.ENTRY[1][:46])
 
         # The signature is converted into int for the sake of consistency
         self.HEADERS['cdfh'] = [signature, self.VERSION_BY, self.VERSION, self.FLAGS, self.METHOD,
                                 mod_time, mod_date, self.CRC32, self.COMPRESSED_SIZE, self.UNCOMPRESSED_SIZE, filename_length,
-                                extra_field, file_comment_length, self.DISK_NUMBER, self.INTERNAL_ATTRIBUTES,
+                                extra_field, self.COMMENT_LENGTH, self.DISK_NUMBER, self.INTERNAL_ATTRIBUTES,
                                 self.EXTERNAL_ATTRIBUTES, self.RELATIVE_OFFSET]
-
+        
+        self.COMMENT = self.ENTRY[1][46 + self.FILENAME_LENGTH : 46 + self.FILENAME_LENGTH + self.COMMENT_LENGTH]
         # Data descriptor
         # Appearantly compressed size and uncompressed size only provided on data descriptor
         # if the file was encrypted, otherwise they appear at local file header/central directory
@@ -344,6 +370,9 @@ class IOP():
                                           self.COMPRESSED_SIZE, self.UNCOMPRESSED_SIZE]
 
         self.ENTRY_BYTES = self.__entry_bytes()
+        self.ENTRY_LENGTH = self.__entry_length()
+        self.CENTRAL_LENGTH = self.__central_length()
+        self.IS_SECONDARY = self.__is_secondary()
 
         if not self.IS_LAST:
             return
@@ -361,16 +390,14 @@ class IOPY():
 
     .iop are similar to zip files, but they're slightly modifed that it cannot be open with other zip programs.
 
-    This class only accept entry like this ([local header], [file entry], [descriptor (if any)], [central header],
-    [end header (only for last entry)])
-
     Attributes:
         file: class: `str` Type: `args`\n
             The location of .iop file. If this file is an .iop, it will deconstruct it, otherwise it will be treated
             as constructing .iop file.
         iop_filename: class: `str`: `kwargs`\n
             Filename that will be used for generated archive file. If not provided, then the file/folder name will be used
-            for the archive name instead. Ignored for deconstructing
+            for the archive name instead. For inserting, it will be ignored if `overwrite` argument is `True`, default to
+            the original filename if not provided.
         dir: class: `str` Type: `kwargs`\n
             Directory used to extract files into. Defaults to current folder. Ignored for constructing, it will generate
             file on current directory
@@ -380,7 +407,8 @@ class IOPY():
             Used to determine password used for .iop files, each region have different password. Defaults to kr.
             If set to `None`, then encryption will not be used, will cause error for decryption
         bytes_io: class: `bool` Type: `kwargs`\n
-            If set to `True`, then extract function will return bytesIO instead of saving the file. Defaults to `False`.
+            If set to `True`, then extract function will return bytesIO instead of saving the file. If used for constructing, it can
+            be accessed through class.IOP variable. Defaults to `False`.
         silent: class: `bool` Type: `kwargs`\n
             If set to `True`, then the class will not print the saved filename. Defaults to True
     """
@@ -404,18 +432,45 @@ class IOPY():
         self.BYTESIO = kwargs.get('bytes_io', False)
         self.SILENT = kwargs.get('silent', True)
 
+        self.IS_MODIFIED = False
+
         self.FILE_LIST = []
         self.RAW_FILE_LIST = []
         self.FILENAME_LIST = {}
 
+        # suggestion: use sets since they does not allow duplicate entry
         self.RAW_ENTRY = []
         self.ENTRY = []
-        self.KEY_ENTRY = {}
+        self.DICT_ENTRY = {}
+        self.KEY_ENTRY = []
 
-        # predefined password from source code https://github.com/LSFDC/.github/tree/main/profile
         self.PASSWORD = kwargs.get('password', 'kr')
-        if not self.PASSWORD is None:
-            self.PASSWORD = self.PASSWORD.lower()
+        self.set_password(self.PASSWORD)
+
+        self.__detect_operation()
+
+        self.__iop = None
+
+        if self.OPERATION == 'r':
+            self.__process_split()
+            self.EXTRACT_ITER = iter(self.ENTRY)
+        else:
+            self.ENCRYPTED = False if self.PASSWORD is None else True
+            self.IOP = self.__process_zipping()
+
+    def set_password(self, password_key: str = None):
+        """
+        Set a new password to a different one, or empty them
+
+        Arguments:
+            password_key: class: `str`|`None`
+                If set to `None`, password will be emptied, otherwise it will set to a new one based on the identifier
+        """
+        if not password_key is None:
+            # predefined password from source code
+            # https://github.com/LSFDC/.github/tree/main/profile
+            # base 2014 source: https://drive.google.com/file/d/1kUgJKnl6CeoCsSUpEkD7qIMF7aix7dbR/view
+            self.PASSWORD = password_key.lower()
             self.PW_KR = [b"iosuccess#@", b"XrFrI0%3BF%!0Dcx$30-"]
             self.PW_ID = [b"T*$f40FRjfoe*(fl304d", b"Mfe$%2049eFeodk*&31Z"]
             self.PW_US = [b"eE39DkE!%E0", b"Eg%^io03UT$Cvf921-!$"]
@@ -448,16 +503,11 @@ class IOPY():
             elif self.PASSWORD == 'eu':
                 self.PASSWORD = self.PW_EU
             else:
-                raise KeyError('Unknown password')
-
-        self.__detect_operation()
-
-        if self.OPERATION == 'r':
-            self.__process_split()
-            self.EXTRACT_ITER = iter(self.ENTRY)
+                print('Unknown password argument, password is set to None instead')
+                self.PASSWORD = None
+                # raise KeyError('Unknown password')
         else:
-            self.ENCRYPTED = False if self.PASSWORD is None else True
-            self.__process_zipping()
+            self.PASSWORD = None
 
     def __detect_operation(self):
         """
@@ -482,7 +532,7 @@ class IOPY():
                 # needed for consistency and because zip file use forward slash
                 self.FILE = self.FILE.replace('\\', '/')
 
-    def __DOSTime(self, time_input: tuple|float|int) -> tuple|datetime:
+    def __DOSTime(self, time_input: tuple|float|int) -> tuple[int, int]|datetime:
         """
         https://learn.microsoft.com/en-us/windows/win32/sysinfo/ms-dos-date-and-time
 
@@ -532,7 +582,7 @@ class IOPY():
                 crc32 = zlib.crc32(chunk, crc32)
         return crc32 & 0xFFFFFFFF
     
-    def __encrypt_file(self, filename, time: int = 0):
+    def __compress_file(self, filename, time: int = 0) -> tuple[bytes, int]:
         """
         Open a file, compress them, and encrypt (if self.ENCRYPTED is set to True) them using ZipCrypto Encryption.
         
@@ -560,6 +610,79 @@ class IOPY():
                 file_bytes = header + file_bytes
             return file_bytes, uncompressed_size
 
+    def __walk_file(self, filepath: str) -> list:
+        """
+        Walk through a directory, and returns the list of all files, and directories
+        """
+        file_list = []
+        for root, dirs, files in os.walk(filepath):
+            root = root.replace('\\', '/')
+                                # self.FILE
+            root = root.replace(f'{filepath}', '', 1)
+            root = root if root.endswith('/') or root == '' else root + '/'
+            if root:
+                file_list.append(root)
+
+            for x in files:
+                # Suggestion: use posixpath which always use '/'
+                file_list.append(os.path.join(root, x).replace('\\', '/'))
+        return file_list
+
+    def __construct_iop(self, file_path: str, filename: str, is_last: bool, central_count: int, central_length: int, central_offset: int, relative_offset: int) -> tuple[IOP, int]:
+        """
+        Opens a file and construct them into single IOP entry. Returns the IOP class, compressed
+        """
+        file = pathlib.Path(file_path + filename)
+        # os.path.getctime() would've been much easier, but not cross platform
+        # https://stackoverflow.com/questions/237079/how-do-i-get-file-creation-and-modification-date-times
+        is_dir = file.is_dir()
+        modified_time = file.stat().st_mtime
+        time, date = self.__DOSTime(modified_time)
+        if is_dir:
+            file_bytes = None
+            uncompressed_size = 0
+        else:
+            file_bytes, uncompressed_size = self.__compress_file(file_path + filename, time)
+
+        central_offset += 30
+        central_offset += len(filename)
+        central_offset += len(file_bytes) if file_bytes else 0
+        central_offset += 16 if self.ENCRYPTED and not is_dir else 0
+
+        crc32 = self.__get_crc32(file_path + filename) if not is_dir else 0
+        entry = IOP(file_bytes, filename=filename, encrypted=self.ENCRYPTED, mod_time=time,
+                    mod_date=date, crc32=crc32, uncompressed_size=uncompressed_size, is_last=is_last,
+                    central_count=central_count, central_length=central_length, central_offset=central_offset,
+                    relative_offset=relative_offset)
+        return entry, central_offset
+
+    def __write_headers(self, iop: io.BytesIO, entry: IOP, central_bytes: bytes, is_last: bool):
+        local_header = struct.pack('<IHHHHHIIIHH', *entry.HEADERS['local'])
+        filename_header = entry.FILENAME.encode('utf-8')
+        iop.write(local_header)
+        iop.write(filename_header)
+        iop.write(entry.ENTRY_BYTES)
+        if entry.ENCRYPTED and not entry.IS_DIR:
+            descriptor_header = struct.pack('<IIII', *entry.HEADERS['descriptor'])
+            iop.write(descriptor_header)
+        central_header = struct.pack('<IHHHHHHIIIHHHHHII', *entry.HEADERS['cdfh'])
+        central_bytes += central_header
+        central_bytes += filename_header
+        central_bytes += entry.COMMENT # only for inserting, since korean files may indicate program to use secondary password
+        if is_last:
+            entry.HEADERS['eocd'][5] = len(central_bytes) # redundant for inserting
+            end_header = struct.pack(
+                '<IHHHHIIH', *entry.HEADERS['eocd'])
+            iop.write(central_bytes)
+            iop.write(end_header)
+
+        if not self.SILENT:
+            if entry.IS_DIR:
+                print('Directory written: ', entry.FILENAME)
+            else:
+                print('File written: ', entry.FILENAME)
+
+        return iop, central_bytes
 
     def __process_zipping(self) -> None|io.BytesIO:
         """
@@ -570,102 +693,42 @@ class IOPY():
         iop.name = self.IOP_FILENAME
         central_bytes = b''
         if self.OPERATION == 'wf':
-            # os.path.getctime() would've been much easier, but not cross platform
-            # https://stackoverflow.com/questions/237079/how-do-i-get-file-creation-and-modification-date-times
-            file = pathlib.Path(self.FILE)
-            modified_time = file.stat().st_mtime
-            time, date = self.__DOSTime(modified_time)
-            crc32 = self.__get_crc32(self.FILE)
-
-            file_bytes, uncompressed_size = self.__encrypt_file(self.FILE, time)
-
-            central_offset = 30 + len(file.name) + len(file_bytes)
-            central_offset += 16 if self.ENCRYPTED else 0
-            entry = IOP(file_bytes, file.name, self.ENCRYPTED, mod_time=time, mod_date=date, crc32=crc32,
-                        uncompressed_size=uncompressed_size, is_last=True, central_offset=central_offset, central_count=1,
-                        relative_offset=0)
+            entry, _ = self.__construct_iop(os.path.dirname(self.FILE), os.path.basename(self.FILE), True, 1, 46+len(os.path.basename(self.FILE)), 0)
 
             iop.write(struct.pack('<IHHHHHIIIHH', *entry.HEADERS['local']))
-            iop.write(file.name.encode('utf-8'))
-            iop.write(file_bytes)
+            iop.write(entry.FILENAME.encode('utf-8'))
+            iop.write(entry.ENTRY_BYTES)
             if self.ENCRYPTED:
                 iop.write(struct.pack('<IIII', *entry.HEADERS['descriptor']))
             iop.write(struct.pack('<IHHHHHHIIIHHHHHII', *entry.HEADERS['cdfh']))
-            iop.write(file.name.encode('utf-8'))
+            iop.write(entry.FILENAME.encode('utf-8'))
             iop.write(struct.pack('<IHHHHIIH', *entry.HEADERS['eocd']))
 
         else:
-            file_list = []
-            root_files = []
             # double check, redundant since self.FILE is already ended with '/'
             path = self.FILE if self.FILE.endswith('/') else self.FILE + '/'
-            for root, dirs, files in os.walk(path):
-                root = root.replace('\\', '/')
-                root = root.replace(f'{self.FILE}/', '', 1)
-                root = root if root.endswith('/') or root == '' else root + '/'
-                if root:
-                    file_list.append(root)
-
-                for x in files:
-                    # Suggestion: use posixpath which always use '/'
-                    file_list.append(os.path.join(root, x).replace('\\', '/'))
+            file_list = self.__walk_file(path)
 
             # file_list.sort()
             central_count = len(file_list)
+            central_length = 0
             central_offset = 0
             last_item_check = len(file_list) - 1
 
             for index, filename in enumerate(file_list):
                 is_last = index == last_item_check
-                file_path = path + filename
-                file = pathlib.Path(file_path)
+                central_length += 46 + len(filename)
+                entry, central_offset = self.__construct_iop(path, filename, is_last, central_count, central_length, central_offset, relative_offset)
+                # Only for debug purposes
+                # This is not needed since file is automically saved
+                self.ENTRY.append(entry)
 
-                is_dir = file.is_dir()
-                modified_time = file.stat().st_mtime
-                time, date = self.__DOSTime(modified_time)
-                if is_dir:
-                    file_bytes = None
-                    uncompressed_size = 0
-                else:
-                    file_bytes, uncompressed_size = self.__encrypt_file(file_path, time)
-
-                central_offset += 30
-                central_offset += len(filename)
-                central_offset += len(file_bytes) if file_bytes else 0
-                central_offset += 16 if self.ENCRYPTED and not is_dir else 0
-
-                crc32 = self.__get_crc32(file_path) if not is_dir else 0
-                entry = IOP(file_bytes, filename=filename, encrypted=self.ENCRYPTED, mod_time=time,
-                            mod_date=date, crc32=crc32, uncompressed_size=uncompressed_size, is_last=is_last,
-                            central_offset=central_offset, central_count=central_count,
-                            relative_offset=relative_offset)
-
-                local_header = struct.pack('<IHHHHHIIIHH', *entry.HEADERS['local'])
-                filename_header = filename.encode('utf-8')
-                iop.write(local_header)
-                iop.write(filename_header)
-                iop.write(file_bytes if file_bytes else b'')
-                relative_offset += len(local_header)
-                relative_offset += len(filename_header)
-                relative_offset += len(file_bytes) if file_bytes else 0
-                if self.ENCRYPTED and not is_dir:
-                    descriptor_header = struct.pack('<IIII', *entry.HEADERS['descriptor'])
-                    iop.write(descriptor_header)
-                    relative_offset += len(descriptor_header)
-                central_header = struct.pack('<IHHHHHHIIIHHHHHII', *entry.HEADERS['cdfh'])
-                central_bytes += central_header
-                central_bytes += filename_header
-                if is_last:
-                    entry.HEADERS['eocd'][5] = len(central_bytes)
-                    end_header = struct.pack('<IHHHHIIH', *entry.HEADERS['eocd'])
-                    iop.write(central_bytes)
-                    iop.write(end_header)
-
-                if not self.SILENT:
-                    if is_dir:
-                        print('Directory written: ', filename)
-                    else:
-                        print('File written: ', filename)
+                iop, central_bytes = self.__write_headers(iop, entry, central_bytes, is_last)
+                relative_offset += len(30)
+                relative_offset += entry.FILENAME_LENGTH
+                relative_offset += len(entry.ENTRY_BYTES)
+                if self.ENCRYPTED and not entry.IS_DIR:
+                    relative_offset += len(16)
 
         if self.BYTESIO:
             return iop
@@ -708,7 +771,31 @@ class IOPY():
 
         if len(file_entries) != len(central_entries):
             # Maybe the archive is corrupted? Because each file entry are supposed to have their own central
-            raise RuntimeError('File entry or Central Headers contains more than one another. The file might be corrupted.')
+            # I figured out that entry without central is probably because the file was patched somewhat
+            # I don't know if it was the patcher fault, or that's just how it looked like 
+            # raise RuntimeError('File entry or Central Headers contains more than one another. The file might be corrupted.')
+            if not self.SILENT:
+                print('Total number of local header central headers are uneven, attempting to fixing...')
+
+            # After done some testing, this 'faulty' entries is basically an entry without filename, idfk what it is, so I'll just skip them
+            file_entries_length = len(file_entries)
+            central_entries_length = len(central_entries)
+            max = file_entries_length if file_entries_length < central_entries_length else central_entries_length
+
+            for index in range(max):
+                f_entry = file_entries[index]
+                c_entry = central_entries[index]
+
+                version = struct.unpack('<H', f_entry[4:6])[0]
+                filename = f_entry[30:30+version]
+                if not filename in c_entry:
+                    if file_entries_length != max:
+                        file_entries.pop(index)
+                    else:
+                        central_entries.pop(index)
+
+                    if len(file_entries) == len(central_entries):
+                        break
 
         for i, (local, central) in enumerate(zip(file_entries, central_entries)):
             if not i == len(file_entries) - 1:
@@ -719,42 +806,59 @@ class IOPY():
         last_item_check = len(self.RAW_ENTRY) - 1
         self.ENTRY = [IOP(_, is_last=(i==last_item_check)) for i, _ in enumerate(self.RAW_ENTRY)]
 
-        # self.RAW_ENTRY = data.split(ZIP_LOCAL_HEADER_SIGNATURE)
-        # self.RAW_ENTRY = [ZIP_LOCAL_HEADER_SIGNATURE + _ for _ in self.RAW_ENTRY if _]
-
     def __file_list(self):
         """
         Append all files into a variable. ~~Provide two variables, one excluding dir, and one is for indexing purpose.~~
         """
         self.FILE_LIST = [_.FILENAME for _ in self.ENTRY if not _.IS_DIR]
-        # self.RAW_FILE_LIST = [_.FILENAME for _ in self.ENTRY]
-        self.KEY_ENTRY = {k.FILENAME:v for k, v in zip(self.ENTRY, self.ENTRY)}
-        return
+        self.DICT_ENTRY = {k.FILENAME:v for k, v in zip(self.ENTRY, self.ENTRY)}
+        self.KEY_ENTRY = list(self.DICT_ENTRY.keys())
+    
+    def __append_file_list(self, entry: IOP):
+        """
+        Append single entry into the variables
+        """
+        filename = entry.FILENAME
+        if not entry.IS_DIR:
+            self.FILE_LIST.append(filename)
+        self.DICT_ENTRY[filename] = entry
+        self.KEY_ENTRY.append(filename)
 
-    # Was meant for extract_by_name() function, but was later scraped
-    # def __filename_list(self) -> None:
-    #     """
-    #     Append all filename and their respective filename path into a dictionary variable.
-    #     The base filename will be set as key, while the full path will be set as value.
+    # According to the source code, if there is a comment that says '1', it indicate that the entry
+    # must be decrypted using secondary password, otherwise they use primary
+    # They also need to be decrypted again after decompressing with XOR
+    def __encrypt_decrypt(self, entry: bytes, mode: int) -> bytes:
+        """
+        Decrypt a decompressed bytes, or encrypt bytes. Only needed if entry uses secondary password.
 
-    #     If there were duplicates, the value would be set as list instead of str
-    #     """
-    #     if not self.FILE_LIST:
-    #         self.__file_list()
+        Not to be confused with __decrypt_bytes(), which decrypt ZipCrypto encryption
 
-    #     tmp = collections.defaultdict(list)
+        Arguments:
+            entry: class: `bytes`\n
+                Bytes of the decompressed data
 
-    #     for x in self.FILE_LIST:
-    #         filename = os.path.basename(x)
-    #         tmp[filename].append(x)
+            mode: class: `int`\n
+                0 for encrypt, 1 for decrypt
+        
+        Return:
+            bytes: The decrypted bytes content, or the encrypted bytes content
+        """
+        # it is unecessary to encrypt, just use primary password and the game will have no problem with it
 
-    #     self.FILENAME_LIST = {
-    #         filename: paths if len(paths) > 1 else paths[0]
-    #         for filename, paths in tmp.items()
-    #     }
-    #     return
+        # Predefined key from source code, can also be viewed here
+        # https://github.com/LSFDC/losatools/blob/main/src/core/ioppass-generator.ts#L4-L49
+        KEYS = [
+            [255, 1, 2, 9, 89, 32, 123, 39, 34, 211, 222, 244, 100, 129, 23, 1, 4, 3, 29, 30, 1, 4, 5, 7, 8, 233, 89, 1, 98, 67],
+            [48, 29, 96, 1, 9, 48, 57, 213, 178, 123, 67, 90, 2, 4, 254, 255, 6, 8, 9, 23, 90, 44, 214, 199, 108, 119, 3, 2, 2, 0]
+            ]
+        array = bytearray(entry)
+        for i in range(len(array)):
+            array[i] ^= KEYS[mode][i % 30]
+            array[i] ^= KEYS[mode][(len(array) - i) % 30]
 
-    def __decrypt_bytes(self, entry: IOP) -> bytes:
+        return bytes(array)
+
+    def __decrypt_bytes(self, entry: IOP) -> bytes|None:
         """
         Decrypt a bytes using specified password. Raise an error if both password is incorrect.
 
@@ -764,37 +868,44 @@ class IOPY():
 
         Return:
             bytes: The decrypted bytes content
+            None: Password is incorrect
         """
         if not self.PASSWORD:
-            raise ValueError('File is encrypted, password is not set')
+            print('File is encrypted, password is not set')
+            return
+            # raise ValueError('File is encrypted, password is not set')
 
-        password = self.PASSWORD[0]
-        while True:
-            decryptor = ZipCrypto(pwd=password)
-            check = decryptor.decrypt(entry.ENTRY_BYTES[:12])
-            crc_check = (entry.MOD_TIME >> 8) & 0xff
-            if check[11] != crc_check:
-                if password != self.PASSWORD[1]:
-                    password = self.PASSWORD[1]
-                    continue
-                else:
-                    raise RuntimeError('Password incorrect')
-            break
+        password = self.PASSWORD[1] if entry.IS_SECONDARY else self.PASSWORD[0]
+        decryptor = ZipCrypto(pwd=password)
+        check = decryptor.decrypt(entry.ENTRY_BYTES[:12])
+        # They use mod time for checks
+        crc_check = (entry.MOD_TIME >> 8) & 0xff
+        if check[11] != crc_check:
+            # raise RuntimeError('Password incorrect')
+            if not self.SILENT:
+                print('Password incorrect for: ', entry.FILENAME)
+            return
 
         return decryptor.decrypt(entry.ENTRY_BYTES[12:])
 
-    def __decompress_bytes(self, entry: bytes) -> bytes:
+    def __decompress_bytes(self, entry: bytes, is_secondary: bool) -> bytes:
         """
         Decompress a bytes
 
         Arguments:
             entry: class: `bytes`\n
                 Bytes containing the compressed content
+            
+            is_secondary: class: `bool`\n
+                Only used if data needs to be decrypted again after decompression
 
         Return:
             bytes: The uncompressed bytes content
         """
-        return zlib.decompress(entry, wbits=-zlib.MAX_WBITS)
+        file_bytes = zlib.decompress(entry, wbits=-zlib.MAX_WBITS)
+        if is_secondary:
+            file_bytes = self.__encrypt_decrypt(file_bytes, 1)
+        return file_bytes
 
     def __extract(self, filename: str, file: bytes) -> None|io.BytesIO:
         """
@@ -827,6 +938,57 @@ class IOPY():
                 print('Extracted file: ', filename)
         return
 
+    def __process_entry(self, entry: IOP) -> None|bool|io.BytesIO:
+        """
+        Function to process entry.
+
+        Return:
+            None: file is saved
+            False: entry is a directory or encryption fails
+            BytesIO: if `bytes_io` parameters is set to `True`, returns this instead of `None`
+        """
+        if entry.IS_DIR:
+            return False
+
+        entry_bytes = entry.ENTRY_BYTES
+        if entry.ENCRYPTED:
+            entry_bytes = self.__decrypt_bytes(entry)
+            if not entry_bytes:
+                return False
+
+        entry_bytes = self.__decompress_bytes(entry_bytes, entry.IS_SECONDARY)
+
+        return self.__extract(entry.FILENAME, entry_bytes)
+    
+    def __recalculate_offset(self):
+        """
+        Function to recalculate each entries relative offset. This function should be called before saving.
+        """
+        # Since the order of files is not that important, re-ordering the file entry is not necesarry
+        # FYI, it uses arbitrary order https://stackoverflow.com/questions/18282370/in-what-order-does-os-walk-iterates-iterate
+        central_length = 0
+        relative_offset = 0
+        last_item_check = len(self.ENTRY) - 1
+        for index, entry in enumerate(self.ENTRY):
+            is_last = last_item_check == index
+            central_length += entry.CENTRAL_LENGTH
+            print('prev: ', entry.RELATIVE_OFFSET)
+            print('next: ', relative_offset)
+            print()
+            entry.HEADERS['cdfh'][-1] = relative_offset
+
+            relative_offset += entry.ENTRY_LENGTH
+
+            if is_last:
+                print('last: ', entry.HEADERS['eocd'][5])
+                print('curr: ', central_length)
+                # signature, 0, 0, central count, central count, central length, central offset, comment length
+                #     0    | 1| 2|       3      |        4     |        5      |        6      |       7      |
+                entry.HEADERS['eocd'][3] = len(self.ENTRY)
+                entry.HEADERS['eocd'][4] = len(self.ENTRY)
+                entry.HEADERS['eocd'][5] = central_length
+                entry.HEADERS['eocd'][6] = relative_offset
+
     def list_file(self) -> list[str]:
         """
         Returns a list of string containing all the filenames and their directories
@@ -838,25 +1000,130 @@ class IOPY():
             self.__file_list()
         return self.FILE_LIST
 
-    def __process_entry(self, entry: IOP) -> None|bool|io.BytesIO:
+    def save(self, overwrite: bool = False) -> None|bool|io.BytesIO:
         """
-        Function to process entry.
+        Save iop to the specified extract dir. If the argument `overwrite` is set to `True` and `bytes_io` attribute
+        is set to `False`, it will overwrite the original file instead, defaults to `False`.
+
+        This function should only be called after finished inserting file. Constructing iop does not need to be
+        saved since it was already done automatically.
+
+        Arguments:
+            overwrite: whether to overwrite the original file, or save copy to the specified extract dir.
+                       Ignored if `bytes_io` parameter is set to `True`.
 
         Return:
-            None: file is saved
-            False: entry is a directory
-            BytesIO: if `bytes_io` parameters is set to `True`, returns this instead of `None`
+            None: operation completed and file is saved
+            False: file is unchanged
+            BytesIO: if `bytes_io` parameter is set to `True`, this will return the `BytesIO` instead
         """
-        if entry.IS_DIR:
+        if not self.IS_MODIFIED:
             return False
 
-        entry_bytes = entry.ENTRY_BYTES
-        if entry.ENCRYPTED:
+        if overwrite:
+            iop_filename = self.FILE
+        else:
+            if self.IOP_FILENAME:
+                iop_filename = self.IOP_FILENAME if self.IOP_FILENAME.endswith('.iop') else self.IOP_FILENAME + '.iop'
+            else:
+                iop_filename = os.path.basename(self.FILE)
+        
+        self.__recalculate_offset()
+
+        iop = io.BytesIO()
+        iop.name = iop_filename
+        central_bytes = b''
+        last_item_check = len(self.ENTRY) - 1
+        for index, entry in enumerate(self.ENTRY):
+            is_last = index == last_item_check
+            iop, central_bytes = self.__write_headers(iop, entry, central_bytes, is_last)
+        
+        if self.BYTESIO:
+            return iop
+        else:
+            pathlib.Path(iop.name).write_bytes(iop.getbuffer())
+            iop.close()
+            if not self.SILENT:
+                print(print('File saved: ', iop.name))
+
+    def insert(self, filename: str) -> None|bool:
+        """
+        Insert a new file into the archive. If a file already exist inside archive, it will
+        overwrite it.
+
+        Does not return anything, save() function must be run to save the file.
+
+        Arguments:
+            filename: class: `str`
+                The existing filename or directory. If filename is directory, it will insert all
+                files inside that directory
+
+        Return:
+            None: operation completed
+            False: file is not found
+        """
+        if not self.KEY_ENTRY:
+            self.__file_list()
+
+        file = pathlib.Path(filename)
+        if not file.exists():
+            print('File/directory does not exist')
+            return False
+
+        self.IS_MODIFIED = True
+
+        if file.is_dir():
+            path = filename + '/' if not filename.endswith('/') else filename
+            path = path.replace('\\', '/')
+            file_list = self.__walk_file(path)
+        else:
+            path = os.path.dirname(filename)
+            file_list = [os.path.basename(filename)]
+
+        for files in file_list:
+            entry, _ = self.__construct_iop(path, files, False, 0, 0, 0, 0)
+
+            try:
+                index = self.KEY_ENTRY.index(entry.FILENAME)
+                eocd_headers = None
+                if 'eocd' in self.ENTRY[index].HEADERS:
+                    eocd_headers = self.ENTRY[index].HEADERS['eocd']
+                self.ENTRY[index] = entry
+                if eocd_headers:
+                    self.ENTRY[index].IS_LAST = True
+                    self.ENTRY[index].HEADERS['eocd'] = eocd_headers
+            except ValueError:
+                self.ENTRY[-1].IS_LAST = False
+                eocd_headers = self.ENTRY[-1].HEADERS.pop('eocd')
+                self.ENTRY.append(entry)
+                self.ENTRY[-1].IS_LAST = True
+                self.ENTRY[-1].HEADERS['eocd'] = eocd_headers
+                self.__append_file_list(entry)
+
+    def password_check(self) -> bool|None:
+        """
+        Function to check whether password is correct or not
+
+        Return:
+            True: if password is correct
+            False: if password is incorrect
+            None: if none of the entry requiring password
+        """
+        if not self.OPERATION == 'r':
+            raise ValueError("Unsupported operation, expected 'r'")
+
+        max_entries = 5 # iterating through the entire entry may be slow since .iop files tends to have 10k+ entries
+        count = 0 
+        for entry in self.ENTRY:
+            if count == max_entries:
+                return False
+            if entry.IS_DIR or not entry.ENCRYPTED:
+                count += 1 if not entry.ENCRYPTED and not entry.IS_DIR else 0
+                continue
+            
             entry_bytes = self.__decrypt_bytes(entry)
-
-        entry_bytes = self.__decompress_bytes(entry_bytes)
-
-        return self.__extract(entry.FILENAME, entry_bytes)
+            return True if entry_bytes else False
+        return
 
     def extract(self) -> None|bool|io.BytesIO:
         """
@@ -881,7 +1148,28 @@ class IOPY():
             print('Nothing to extract')
             return False
 
-    def extract_by_name(self, filename) -> None|bool|io.BytesIO|dict:
+    # Meant for debug purposes, you're not supposed to know the index since the order may be random
+    def extract_by_index(self, index: int) -> None|bool|io.BytesIO:
+        """
+        Extract by index of entry. First item starts at 0
+
+        Return:
+            None: operation completed and is saved
+            False: this file is a directory or out of index
+            BytesIO: if `bytes_io` parameters is set to `True`, returns this instead of `None`
+        """
+        if not self.OPERATION == 'r':
+            raise ValueError("Unsupported operation, expected 'r' (read)")
+
+        try:
+            entry = self.ENTRY[index]
+        except IndexError:
+            return False
+        
+        file = self.__process_entry(entry)
+        return file
+
+    def extract_by_name(self, filename: str) -> None|bool|io.BytesIO|dict:
         """
         Extract by their filename.
 
@@ -898,14 +1186,17 @@ class IOPY():
         if not self.OPERATION == 'r':
             raise ValueError("Unsupported operation, expected 'r' (read)")
 
-        if not self.KEY_ENTRY:
+        if not self.DICT_ENTRY:
             self.__file_list()
 
-        entry = self.KEY_ENTRY.get(filename, None)
+        entry = self.DICT_ENTRY.get(filename, None)
         if not entry:
             return False
 
         file = self.__process_entry(entry)
+        if file is False:
+            print('Failed to extract, file is either a directory or incorrect password')
+            return
         return file
 
     def extract_all(self) -> None|dict:
@@ -927,3 +1218,9 @@ class IOPY():
             if file:
                 files[file.name] = file
         return files if files else None
+
+    # Aliases
+    file_list = list_file
+    extract_by_filename = extract_by_name
+    exctractall = extract_all
+    change_password = set_password

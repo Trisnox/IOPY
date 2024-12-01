@@ -20,13 +20,13 @@ Run python interpreter or create python script
 ```py
 from iopy import IOPY
 iop_archive = IOPY('path/to/file.iop', password='kr', dir='extract/' silent=False)
-ipo_archive.extractall()
+ipo_archive.extract_all()
 ```
 ## Creating .iop
 To create .iop, just simply supply either directory or any file that is not .iop
 ```py
 from iopy import IOPY
-IOPY('dir/', iop_filename='my_file.iop' password=None, silent=False) # Doesn't return anything, and is automically saved
+IOPY('dir/', iop_filename='my_file.iop' password=None, silent=False) # file automatically saved
 ```
 
 # Help
@@ -38,6 +38,11 @@ Returns a list of string containing all the filenames and their directories
 
 Return:
 - `list[str]`: Contains list of all files, excluding entry that only contains directory
+
+___
+### `set_password(password)`
+Change password into a new one. To empty password, simply call the function without passing `password` argument. Valid password choices are `kr`, `id`, `us`, `tw`, `sg`, `jp`, `th`, `cn`, `latin`, `eu`.
+
 ___
 ### `extract()` -> `None | bool | io.BytesIO`
 Extract the first item, or iter to the next one.
@@ -62,6 +67,24 @@ Extract all contents inside the .iop file
 Return:
 - `None`: operation completed and is saved
 - `dict`: if `bytes_io` parameter is set to `True`, returns this instead of `None`. The `dict` contains `{filename: io.BytesIO or [io.BytesIO, ..]}`
+
+___
+### `insert(filename)` -> `None|Bool`
+Insert a new file into the archive. If a file already exist inside archive, it will overwrite it.
+
+Return:
+- `None`: operation completed
+- `False`: file is not found
+
+### `save(overwrite=False)` -> `None|Bool|io.BytesIO`
+Save iop to the specified extract dir. If the argument `overwrite` is set to `True` and `bytes_io` attribute is set to `False`, it will overwrite the original file instead. Defaults to `False`.
+
+This function should only be called after finished inserting file. Constructing iop does not need to be saved since it was already done automatically.
+
+Return:
+- `None`: operation completed and file is saved
+- `False`: file is unchanged
+- `BytesIO`: if `bytes_io` parameter is set to `True`, this will return the `BytesIO` instead
 
 ## Deconstructing
 ## Attributes
