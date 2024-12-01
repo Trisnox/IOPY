@@ -125,5 +125,4 @@ If set to `True`, then extract function will return bytesIO instead of saving th
 If set to `True`, then the class will not print the saved filename. Defaults to True
 
 # To-Do
-- Inserting file(s)
 - CLI automation (GUI is obsolete due to program already exist)
