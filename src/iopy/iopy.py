@@ -3,6 +3,7 @@ import io
 import os
 import pathlib
 import struct
+import sys
 import zlib
 from datetime import datetime
 
@@ -433,6 +434,7 @@ class IOPY():
         self.SILENT = kwargs.get('silent', True)
 
         self.IS_MODIFIED = False
+        self.PRINT_WARNING = False
 
         self.FILE_LIST = []
         self.RAW_FILE_LIST = []
@@ -680,7 +682,13 @@ class IOPY():
             if entry.IS_DIR:
                 print('Directory written: ', entry.FILENAME)
             else:
-                print('File written: ', entry.FILENAME)
+                # Especially windows command line, printing is very slow
+                # that it took more time to print than processing the actual output
+                if len(self.ENTRY) >= 100 and not self.PRINT_WARNING:
+                    print('Entries contains more than 100 files, output will not be printed')
+                    self.PRINT_WARNING = True
+                else:
+                    print('File written: ', entry.FILENAME)
 
         return iop, central_bytes
 
@@ -729,6 +737,7 @@ class IOPY():
                 relative_offset += len(entry.ENTRY_BYTES)
                 if self.ENCRYPTED and not entry.IS_DIR:
                     relative_offset += len(16)
+            self.PRINT_WARNING = False
 
         if self.BYTESIO:
             return iop
@@ -972,16 +981,11 @@ class IOPY():
         for index, entry in enumerate(self.ENTRY):
             is_last = last_item_check == index
             central_length += entry.CENTRAL_LENGTH
-            print('prev: ', entry.RELATIVE_OFFSET)
-            print('next: ', relative_offset)
-            print()
             entry.HEADERS['cdfh'][-1] = relative_offset
 
             relative_offset += entry.ENTRY_LENGTH
 
             if is_last:
-                print('last: ', entry.HEADERS['eocd'][5])
-                print('curr: ', central_length)
                 # signature, 0, 0, central count, central count, central length, central offset, comment length
                 #     0    | 1| 2|       3      |        4     |        5      |        6      |       7      |
                 entry.HEADERS['eocd'][3] = len(self.ENTRY)
@@ -1037,6 +1041,7 @@ class IOPY():
         for index, entry in enumerate(self.ENTRY):
             is_last = index == last_item_check
             iop, central_bytes = self.__write_headers(iop, entry, central_bytes, is_last)
+        self.PRINT_WARNING = False
         
         if self.BYTESIO:
             return iop
